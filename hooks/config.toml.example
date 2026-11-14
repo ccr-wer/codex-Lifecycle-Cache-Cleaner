@@ -1,0 +1,27 @@
+# Codex hook 注册示例（config.toml 形态）
+#
+# 说明：
+#   - 字段名随 Codex 版本可能不同，以本机 codex 的 hooks 文档为准；
+#     这里给的是「一个命令 + 超时」的最小形态。
+#   - Windows 请使用绝对路径，例如 C:/Users/you/.codex/memory-cleaner/hooks/session-end.js
+#   - hook 必须往 stdout 输出一行 JSON，注入上下文只能靠其中的 systemMessage。
+
+[hooks.SessionStart]
+command = "node $HOME/.codex/memory-cleaner/hooks/session-start.js"
+timeout_sec = 30
+
+[hooks.SessionEnd]
+command = "node $HOME/.codex/memory-cleaner/hooks/session-end.js"
+timeout_sec = 120
+
+[hooks.PreCompact]
+command = "node $HOME/.codex/memory-cleaner/hooks/pre-compact.js"
+timeout_sec = 30
+
+[hooks.PostToolUse]
+matcher = "mcp__.*"
+command = "node $HOME/.codex/memory-cleaner/hooks/post-tool-use.js"
+timeout_sec = 30
+
+# 下面这项插件不能在线改，只能由你维护；插件只会在 SessionStart 的锚点里提示。
+# model_context_window = 256000

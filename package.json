@@ -1,0 +1,28 @@
+{
+  "name": "codex-memory-cleaner",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Codex local-deployment: verifiable memory consolidation + local inference cleanup via lifecycle hooks",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "bin": {
+    "codex-memory": "hooks/hook-runner.js"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "test:v1": "node --test test/v1-summary-too-long.test.js",
+    "test:v2": "node --test test/v2-rss-drop.test.js",
+    "test:v3": "node --test test/v3-cleanup-failure.test.js",
+    "test:v4": "node --test test/v4-adversarial.test.js",
+    "test:v5": "node --test test/v5-concurrency.test.js",
+    "test:v6": "node --test test/v6-crash-recovery.test.js",
+    "hook:session-start": "node hooks/session-start.js",
+    "hook:session-end": "node hooks/session-end.js",
+    "hook:pre-compact": "node hooks/pre-compact.js",
+    "hook:post-tool-use": "node hooks/post-tool-use.js",
+    "memory:status": "node hooks/hook-runner.js status",
+    "memory:confirm": "node hooks/hook-runner.js confirm-memory"
+  }
+}

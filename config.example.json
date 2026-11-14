@@ -1,0 +1,50 @@
+{
+  "_comment": "拷到 ~/.codex/memory/config.json（全局）或 <cwd>/.codex/memory/config.json（项目）。项目层覆盖全局层。",
+  "engine": {
+    "provider": "ollama",
+    "model": "qwen2.5-coder:7b",
+    "endpoint": "http://127.0.0.1:11434",
+    "pid": null,
+    "timeoutMs": 60000
+  },
+  "cleanup": {
+    "enabled": true,
+    "verifyRss": true,
+    "rssDropRatio": 0.2,
+    "rssMinDropBytes": 67108864,
+    "waitMs": 15000,
+    "pollMs": 300
+  },
+  "summarize": {
+    "enabled": true,
+    "maxTokens": 900,
+    "maxChars": 8000,
+    "timeoutMs": 60000
+  },
+  "trace": {
+    "turns": 6,
+    "maxChars": 4000,
+    "perTurnChars": 700,
+    "tailBytes": 262144
+  },
+  "spill": {
+    "thresholdBytes": 32768
+  },
+  "inject": {
+    "maxChars": 4000,
+    "negations": 12,
+    "openItems": 25,
+    "doneItems": 5,
+    "sharedChars": 800
+  },
+  "limits": {
+    "entityJaccardMin": 0.6,
+    "entryJaccardMin": 0.5,
+    "groundingJaccardMin": 0.6,
+    "droppedRatioLimit": 0.3,
+    "maxItems": 200
+  },
+  "lock": {
+    "ttlMs": 120000
+  }
+}
