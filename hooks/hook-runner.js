@@ -3,7 +3,8 @@
  * hooks/hook-runner.js — Codex hook 的统一入口。
  *
  * 铁律（Codex 版最容易翻车的地方）：
- *  - 结果只能通过 stdout 的 JSON `systemMessage` 注入上下文，console.log 文本没用。
+ *  - SessionStart 的上下文注入只能走 hookSpecificOutput.additionalContext；
+ *    systemMessage 只当「给用户看的提示」，不承担注入。
  *  - hook 进程永远 exit 0：固化失败也不能把用户的会话搞崩，错误写 state/hook-errors.log。
  *  - stdout 只许出现一行 JSON，调试信息走 stderr 或日志文件。
  */
@@ -83,6 +84,22 @@ function appendErrorLog(paths, event, err) {
   }
 }
 
+/**
+ * 把 cleaner 结果转成宿主 hook 的 wire 格式。
+ * A 方案：SessionStart 只输出 hookSpecificOutput.additionalContext，
+ * 其他事件仍用 systemMessage（用户可见提示，不承担上下文注入）。
+ */
+export function toWireOutput(event, out) {
+  if (!out) return {};
+  if (event === 'session-start' && typeof out.additionalContext === 'string') {
+    return {
+      hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: out.additionalContext },
+    };
+  }
+  const { additionalContext, ...rest } = out;
+  return rest;
+}
+
 export async function runHook(event, { argv = process.argv.slice(2) } = {}) {
   const handler = EVENT_HANDLERS[event];
   if (!handler) throw new Error(`unknown hook event: ${event}`);
@@ -100,7 +117,7 @@ export async function runHook(event, { argv = process.argv.slice(2) } = {}) {
     if (process.env.CODEX_MEMORY_DEBUG === '1') {
       process.stderr.write(`[codex-memory] ${event} ${JSON.stringify(out?.status)}\n`);
     }
-    process.stdout.write(`${JSON.stringify(out ?? {})}\n`);
+    process.stdout.write(`${JSON.stringify(toWireOutput(event, out))}\n`);
     return out;
   } catch (err) {
     const fallbackPaths = paths || defaultPaths({ home: config.home, cwd });

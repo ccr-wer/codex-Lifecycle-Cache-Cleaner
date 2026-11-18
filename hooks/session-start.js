@@ -2,7 +2,8 @@
 /**
  * Codex hook: SessionStart
  * payload: {session_id, transcript_path, cwd, hook_event_name:"SessionStart", source:"startup|resume|compact|fork"}
- * 输出: {"systemMessage": "...锚点..."}  <- 只有这个字段能进上下文
+ * 输出: {"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"..."}}
+ *       <- 只有 additionalContext 会进入模型上下文（本轮已按 A 方案确认）
  */
 import { runHook } from './hook-runner.js';
 

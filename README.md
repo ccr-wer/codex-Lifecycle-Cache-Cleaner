@@ -4,7 +4,7 @@ Codex 本地部署版的「可校验记忆固化 + 本地推理清理」插件�
 纯 JS、跨平台、不依赖任何框架；只用 Codex lifecycle hook + 本地推理 HTTP API。
 
 > 和 DSH（进程内插件）版最大的差别：这里**没有** `destroyEngine()` 和 `rebuildSession()`。
-> 清理只能通过 HTTP 让引擎卸载模型；会话上下文只能靠 `SessionStart` 的 `systemMessage` 注入锚点。
+> 清理只能通过 HTTP 让引擎卸载模型；会话上下文只能靠 `SessionStart` 的 `additionalContext` 注入锚点。
 > 因此本插件**不做**在线重建，也**不做** `n_ctx` / `model_context_window` 的在线修改。
 
 ---
@@ -63,14 +63,35 @@ codex-memory-cleaner/
 
 ```
 读旧日志 → 廉价轨迹 append → 模型总结 + L5 校验 → 写暂存稿(staging)
-        → 清理本地引擎（HTTP + RSS 复核） → 提交日志(worklog) → journal.done
+        → 引擎闸门（探测 → 归属 → 放行/拒绝）→ 清理（HTTP + RSS 复核）
+        → 提交日志(worklog) → journal.done
 ```
 
 - 清理失败 → **不提交**，暂存稿留在 `state/staging/<sid>.md`，下次 SessionEnd 续跑（V3/V6）。
 - 摘要超长 / L5 被拒 → 只落原始轨迹，**本轮不清理引擎**（V1）。
 - 全程持文件锁 → 并发 SessionEnd 只有一个能跑（V5）。
 
-### 2.2 工作日志格式
+### 2.2 引擎闸门（唯一出口）
+
+新增 `engine-gate.js`，所有清理路径都必须经过它：
+`探测 → 归属判定 → 放行/拒绝 → 执行 → 验证 → 审计`。
+
+| 探测结果 | 引擎写次数 | 审计码 |
+|---|---|---|
+| `owned_idle` | 1 | `engine_cleaned` / `engine_cleanup_failed` |
+| `owned_busy` | 0 | `engine_busy` |
+| `foreign`（本机有引擎，但不属于本插件） | 0 | `engine_foreign` |
+| `absent`（根本没部署/没加载） | 0 | `engine_absent` |
+| `unknown`（探测缺失/异常） | 0 | `engine_unknown` |
+
+- 归属只认显式声明：`engine.owned: true`（或适配器自证 `owned`），**不做同名模型推断**；
+  登记落在 `state/engine-registry.json`，清理时只做校验。
+- 每次判定都写 `state/engine-audit.jsonl`，`unknown` 也写——否则线上只能看到「什么都没发生」。
+- 除 `engine-gate.js` 外，业务代码不得调用 `cleanupLocalEngine`（测试 I6 静态扫描）。
+- 原生记忆 `~/.codex/memories` 只读导入并合入锚点（scope=`native`），**永不写回**；
+  目录缺失或不可读时静默跳过，不影响注入。写入仍只走本插件的共享层（确认机制）。
+
+### 2.3 工作日志格式
 
 ```markdown
 <!--meta {"v":1,"sessionId":"thr_123","revision":3,"negationCount":2,"traceHashes":["ab12cd34"],"precompact":1,...} -->
@@ -160,7 +181,8 @@ timeout_sec = 30
 model_context_window = 256000
 ```
 
-> ⚠️ hook 的输出必须走 stdout 的 JSON `systemMessage` 字段。直接 `print` / `console.log` 文本不会进入上下文，
+> ⚠️ hook 的输出必须走 stdout 的 JSON：`SessionStart` 用 `hookSpecificOutput.additionalContext` 注入上下文，
+> 其余事件用 `systemMessage` 做用户可见提示。直接 `print` / `console.log` 文本不会生效，
 > 这是 Codex 版最常见的「看起来跑了但没生效」原因。
 
 ### 3.4 插件配置
@@ -221,8 +243,8 @@ node --test test/v4-adversarial.test.js
 ### 预期结果（本机 Node v24.16.0 / Windows 实测）
 
 ```
-ℹ tests 28
-ℹ pass 28
+ℹ tests 37
+ℹ pass 37
 ℹ fail 0
 ```
 
@@ -235,6 +257,8 @@ node --test test/v4-adversarial.test.js
 | V4 a/b/c/d | ID 重编号（模型自带 id、文件断号）、状态翻转、两合一、同状态改文本 —— 四种全拒，且清理 0 次 | 通过 |
 | V5 | 两个子进程同时 SessionEnd → 一个 `ok` 一个 `busy`，清理计数 = 1 | 通过 |
 | V6 | stage 后崩溃（exit 70）→ 重启续跑，`attempt=2`、条目只落一次、轨迹不重复追加 | 通过 |
+| V7 | 闸门 I1–I6：`absent`/`foreign`/`unknown` 一律引擎写 0，审计码可区分 | 通过 |
+| V8 | SessionStart 只输出 `additionalContext`；原生记忆只读导入 | 通过 |
 
 V2 用的是「假引擎进程 + 假 Ollama」，证伪的是**测量链路 + 卸载语义**。
 换成真 Ollama 时把 `engine.endpoint` / `engine.pid` 指过去即可，同一套断言仍然有效。
@@ -243,9 +267,10 @@ V2 用的是「假引擎进程 + 假 Ollama」，证伪的是**测量链路 + �
 
 ## 5. Codex 版的固有局限（必须知道）
 
-1. **PreCompact 不能阻止压缩。**
-   它只是「压缩前通知」。插件能做的是在压缩发生前把轨迹和水位写进 worklog，
-   压缩之后靠 `SessionStart` 注入锚点找回。压缩本身照样发生，token 该涨还是涨。
+1. **PreCompact 能否阻止压缩：未确认。**
+   `pre-compact.command.output` 的 schema 只有 `continue` / `stopReason` / `suppressOutput` / `systemMessage`，
+   没有 `decision` 字段。理论上 `continue:false` 可中断，但本轮未做成活体验证（`codex debug prompt-input` 不触发 hook），
+   所以插件不依赖这条路：压缩前落轨迹与水位，压缩后用 `SessionStart` 注入锚点找回。
 
 2. **PostToolUse 不能撤回已经进入上下文的输出。**
    这是降级版 `overflow_guard`：只能在 tool result 超过阈值时落盘备份，并回一条
@@ -277,13 +302,19 @@ V2 用的是「假引擎进程 + 假 Ollama」，证伪的是**测量链路 + �
    L5 只能保证「结构没被偷偷改」和「新条目能在原文找到实体依据」，
    不能保证总结写得对。摘要被拒时日志保留原始轨迹，宁可少一条也不写错一条。
 
+9. **hook 注册位置未确认。**
+   本机实测：`~/.codex/hooks.json` 与 `~/.codex/hooks/hooks.json` 两种写法都没触发，
+   `codex debug prompt-input` 疑似不跑 hook。仓库存量提示是 `.codex/hooks` 路径。
+   插件侧只保证 wire 格式（`hookSpecificOutput.additionalContext`）与退出码正确，
+   注册方式请在目标版本上先验证再上线（见 `hooks/hooks.json` 与 `hooks/config.toml.example`）。
+
 ---
 
 ## 6. Codex 版无法做的事（清单）
 
 - ❌ 进程内 `destroyEngine()` / `rebuildSession()` —— 没有进程内句柄，只有 HTTP。
 - ❌ 在线重建会话 / 在线改 `n_ctx` / 在线改 `model_context_window`。
-- ❌ 阻止自动压缩（PreCompact 只是通知）。
+- ❌ 阻止自动压缩（能否用 `continue:false` 中断：未确认，智能体实测受 hook 注册方式限制）。
 - ❌ 撤回已进入上下文的 tool 输出（PostToolUse 只能落盘）。
 - ❌ 全局拦截工具输出（只有 `PreToolUse` 能拦，但那时还不知道输出多大）。
 - ❌ 压缩 KV Cache 或「保留一部分缓存」。

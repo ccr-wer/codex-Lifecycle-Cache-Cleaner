@@ -29,6 +29,7 @@ import {
 } from './state.js';
 import { parseWorklog, renderWorklog, buildSummaryPrompt, renderAnchors, appendTrace } from './worklog.js';
 import { readTrace } from './raw-trace.js';
+import { EngineGate } from './engine-gate.js';
 
 export const DEFAULT_CONFIG = Object.freeze({
   engine: {
@@ -83,6 +84,7 @@ export class CodexCleaner {
     this.config = mergeConfig(DEFAULT_CONFIG, config);
     this.paths = paths || config.paths || adapter.paths || defaultPaths({ home: config.home, cwd: config.cwd });
     this.faults = new Set(this.config.faults || []);
+    this.gate = new EngineGate({ adapter, config: this.config, paths: this.paths });
     this.logs = [];
     this.config.log = this.config.log || ((m) => this.logs.push(m));
   }
@@ -369,25 +371,17 @@ export class CodexCleaner {
       if (!cleanupAllowed) {
         engine = { ok: true, skipped: true, code: `SKIPPED_SUMMARY_${String(summary.state).toUpperCase()}` };
       } else {
-        try {
-          const r = await this.adapter.cleanupLocalEngine({
-            provider: this.config.engine.provider,
-            model: this.config.engine.model,
-            endpoint: this.config.engine.endpoint,
-            pid: this.config.engine.pid,
-            verifyRss: this.config.cleanup.verifyRss,
-            waitMs: this.config.cleanup.waitMs,
-            pollMs: this.config.cleanup.pollMs,
-            rssDropRatio: this.config.cleanup.rssDropRatio,
-            rssMinDropBytes: this.config.cleanup.rssMinDropBytes,
-          });
-          engine =
-            r && r.ok
-              ? { ok: true, code: r.code || 'OK', result: r }
-              : { ok: false, code: (r && r.code) || 'E_CLEANUP_FAILED', result: r };
-        } catch (err) {
-          engine = { ok: false, code: err.code || 'E_CLEANUP_FAILED', error: String(err.message || err) };
-        }
+        // 唯一出口：探测 -> 归属 -> 放行/拒绝 -> 执行 -> 验证 -> 审计
+        const g = await this.gate.run({ trigger: 'session_end' });
+        engine = g.skipped
+          ? { ok: true, skipped: true, code: g.auditCode, auditCode: g.auditCode, state: g.state, probe: g.probe }
+          : {
+              ok: g.ok,
+              code: (g.cleanup && g.cleanup.code) || g.auditCode,
+              auditCode: g.auditCode,
+              state: g.state,
+              result: g.cleanup,
+            };
       }
       await journal.mark('cleanup', engine);
 
@@ -469,7 +463,14 @@ export class CodexCleaner {
     const shared = {
       global: await this.adapter.readSharedMemory('global'),
       project: await this.adapter.readSharedMemory('project', { cwd }),
+      native: '',
     };
+    try {
+      const native = await this.adapter.readNativeMemory?.();
+      if (native?.available) shared.native = native.text;
+    } catch {
+      /* 原生记忆只读且尽力而为，读不到不影响注入 */
+    }
 
     await this.#noteSession(sid, { transcriptPath: payload.transcript_path, cwd, source, parentId });
 
@@ -491,7 +492,8 @@ export class CodexCleaner {
       chars: systemMessage.length,
       items: doc.items.length,
       negations: doc.negations.length,
-      systemMessage,
+      // A 方案：只走 SessionStart 专属的 additionalContext，不用 systemMessage
+      additionalContext: systemMessage,
     };
   }
 

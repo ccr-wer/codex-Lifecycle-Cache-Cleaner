@@ -54,13 +54,14 @@ export const GROUNDED_SUMMARY = JSON.stringify({
 });
 
 export class StubAdapter extends CodexAdapter {
-  constructor({ root, config = {}, summary = null, summarizeError = null, cleanup = null } = {}) {
+  constructor({ root, config = {}, summary = null, summarizeError = null, cleanup = null, probe = null } = {}) {
     const paths = config.paths || makePaths(root || tempRoot('codex-stub-'));
     super({ ...config, paths });
     this.paths = paths;
     this.summary = summary;
     this.summarizeError = summarizeError;
     this.cleanupImpl = cleanup;
+    this.probeImpl = probe;
     this.calls = { summarize: [], cleanup: [] };
   }
 
@@ -68,6 +69,12 @@ export class StubAdapter extends CodexAdapter {
     this.calls.summarize.push({ prompt, opts });
     if (this.summarizeError) throw this.summarizeError;
     return this.summary ?? GROUNDED_SUMMARY;
+  }
+
+  /** 测试专用：适配器自证归属，绕过真实引擎探测。 */
+  async probeEngine() {
+    if (this.probeImpl) return this.probeImpl();
+    return { ok: true, loaded: true, owned: true, state: 'owned_idle', endpoint: 'stub://local', model: 'stub' };
   }
 
   async cleanupLocalEngine(args = {}) {

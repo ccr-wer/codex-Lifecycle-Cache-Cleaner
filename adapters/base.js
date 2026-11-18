@@ -16,6 +16,7 @@ import {
   writeTextAtomic,
 } from '../state.js';
 import { readTrace } from '../raw-trace.js';
+import { readNativeMemory } from '../native-memory.js';
 
 export class CodexAdapter {
   constructor(config = {}) {
@@ -47,7 +48,18 @@ export class CodexAdapter {
 
   /* ------------------------------------------------------------ 引擎清理 */
 
-  /** 清理本地推理引擎。子类必须实现；返回 {ok, code, ...}。 */
+  /* ------------------------------------------------------------ 引擎探测 */
+
+  /**
+   * 探测引擎状态。子类必须实现；未实现 = unknown = 不清理（fail-closed）。
+   * 返回 {ok, loaded?, state?, owned?, endpoint?, model?, pid?}
+   */
+  async probeEngine(_opts = {}) {
+    return { ok: false, code: 'E_PROBE_NOT_IMPLEMENTED' };
+  }
+
+  /** 清理本地推理引擎。子类必须实现；返回 {ok, code, ...}。
+   *  注意：业务代码不得直接调用，只能经 engine-gate。 */
   async cleanupLocalEngine(_opts = {}) {
     throw new MemoryError('E_NOT_IMPLEMENTED', `${this.constructor.name}.cleanupLocalEngine 未实现`);
   }
@@ -77,6 +89,14 @@ export class CodexAdapter {
 
   async readSharedMemory(scope, { cwd } = {}) {
     return readText(this.sharedFile(scope, cwd));
+  }
+
+  /** 宿主原生记忆：只读导入，永不写入。 */
+  async readNativeMemory() {
+    return readNativeMemory({
+      home: this.config.home,
+      maxChars: this.config.inject?.sharedChars ?? 1200,
+    });
   }
 
   /**

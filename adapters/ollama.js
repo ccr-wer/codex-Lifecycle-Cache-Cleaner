@@ -58,6 +58,26 @@ export class OllamaAdapter extends CodexAdapter {
     return Array.isArray(json?.models) ? json.models : [];
   }
 
+  /** 探测：只回答「加载了什么」，归属由 gate 判定，不在这里做同名启发。 */
+  async probeEngine({ endpoint, model } = {}) {
+    const ep = trimSlash(endpoint || this.endpoint);
+    const target = model || this.model;
+    if (!target) return { ok: false, code: 'E_NO_MODEL' };
+    try {
+      const models = await this.listLoaded(ep);
+      const names = models.map((m) => m.name || m.model);
+      return {
+        ok: true,
+        loaded: names.some((n) => sameModel(n, target)),
+        models: names,
+        endpoint: ep,
+        model: target,
+      };
+    } catch (e) {
+      return { ok: false, code: e.code || 'E_PROBE_FAILED', error: e.message };
+    }
+  }
+
   async summarize(prompt, { maxTokens = 900, timeoutMs = this.timeoutMs } = {}) {
     if (!this.model) throw new MemoryError('E_NO_MODEL', '未配置 engine.model');
     const body = {

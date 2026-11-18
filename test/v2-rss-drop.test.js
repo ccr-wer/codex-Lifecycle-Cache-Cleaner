@@ -44,6 +44,7 @@ const engineConfig = (fake, pid) => ({
   model: 'fake:7b',
   endpoint: fake.url,
   pid,
+  owned: true,
 });
 
 test('V2：Ollama keep_alive:0 后引擎进程 RSS 真实下降', async (t) => {

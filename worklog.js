@@ -205,7 +205,11 @@ export function renderAnchors({
     lines.push('', `## 压缩水位 W${doc.meta.precompact}${w?.at ? ` @ ${w.at}` : ''}（PreCompact 只留锚点，不阻止压缩）`);
   }
 
-  for (const [scope, label] of [['project', '项目习惯'], ['global', '用户偏好']]) {
+  for (const [scope, label] of [
+    ['project', '项目习惯'],
+    ['global', '用户偏好'],
+    ['native', '宿主原生记忆（只读）'],
+  ]) {
     const text = (shared?.[scope] || '').trim();
     if (!text) continue;
     lines.push('', `## 共享记忆 · ${label}`);
