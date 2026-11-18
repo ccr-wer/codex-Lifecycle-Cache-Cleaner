@@ -11,6 +11,7 @@
  */
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
@@ -56,8 +57,14 @@ export class MemoryError extends Error {
 
 /* ------------------------------------------------------------------ 路径 */
 
-export function defaultPaths({ home = process.env.HOME || process.env.USERPROFILE, cwd = process.cwd() } = {}) {
-  const root = home || cwd;
+export function defaultPaths({ home = os.homedir(), cwd = process.cwd() } = {}) {
+  const root = home || '';
+  if (!root) {
+    throw new MemoryError(
+      'E_NO_HOME',
+      '取不到用户主目录（os.homedir / HOME / USERPROFILE 均为空）；拒绝回退到 cwd 静默写入',
+    );
+  }
   const base = path.join(root, '.codex', 'memory');
   return {
     base,
@@ -380,7 +387,35 @@ export function readJsonSync(file, fallback = null) {
   }
 }
 
-/** tmp -> fsync -> rename。中途崩了最多丢 tmp，不会留半个正式文件。 */
+/** 只在 Windows 杀软/索引器会造成的瞬时错误上重试；ENOENT/EXDEV 一次就抛。 */
+const RENAME_RETRY_CODES = new Set(['EPERM', 'EBUSY', 'EACCES']);
+
+function sleepSync(ms) {
+  const ia = new Int32Array(new SharedArrayBuffer(4));
+  Atomics.wait(ia, 0, 0, ms);
+}
+
+export async function renameWithRetry(
+  from,
+  to,
+  { retries = 5, delayMs = 20, fsImpl = fsp, sleepFn = sleepSync } = {},
+) {
+  let lastErr = null;
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      await fsImpl.rename(from, to);
+      return { ok: true, attempts: attempt + 1 };
+    } catch (e) {
+      lastErr = e;
+      if (!RENAME_RETRY_CODES.has(e.code)) throw e;
+      if (attempt === retries) break;
+      sleepFn(delayMs * (attempt + 1));
+    }
+  }
+  throw lastErr;
+}
+
+/** tmp -> fsync -> rename（带瞬时错误退避）。中途崩了最多丢 tmp，不会留半个正式文件。 */
 export async function writeTextAtomic(file, text) {
   await fsp.mkdir(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
@@ -391,7 +426,7 @@ export async function writeTextAtomic(file, text) {
   } finally {
     await fh.close();
   }
-  await fsp.rename(tmp, file);
+  await renameWithRetry(tmp, file);
   return { bytes: Buffer.byteLength(text), sha: sha256(text) };
 }
 

@@ -10,7 +10,7 @@
  */
 import { CodexAdapter } from './base.js';
 import { MemoryError } from '../state.js';
-import { readRssBytes, waitForRssDrop, sleep } from '../rss.js';
+import { sampleMemory, waitForRssDrop, sleep } from '../rss.js';
 
 const trimSlash = (s) => String(s || '').replace(/\/+$/, '');
 const baseName = (m) => String(m || '').split(':')[0].toLowerCase();
@@ -110,7 +110,13 @@ export class OllamaAdapter extends CodexAdapter {
     if (!target) throw new MemoryError('E_NO_MODEL', 'cleanup 需要 engine.model');
     const ep = trimSlash(endpoint || this.endpoint);
     const t0 = Date.now();
-    const rssBefore = pid ? await readRssBytes(pid) : null;
+    const samplerOpts = {
+      platform: this.config.platform,
+      kind: this.config.samplerKind,
+      hasNvidia: this.config.hasNvidia,
+    };
+    const baseline = pid ? await sampleMemory(pid, samplerOpts) : { ok: false, code: 'E_NO_PID' };
+    const rssBefore = baseline.ok && !baseline.gone ? baseline.bytes : null;
 
     const out = await this.#post(
       '/api/generate',
@@ -168,7 +174,18 @@ export class OllamaAdapter extends CodexAdapter {
     }
 
     let rss = null;
-    if (pid && verifyRss && rssBefore) {
+    if (verifyRss) {
+      if (!rssBefore) {
+        return {
+          ok: false,
+          code: 'RSS_UNVERIFIABLE',
+          provider: 'ollama',
+          waitedMs: Date.now() - t0,
+          rssBefore: null,
+          sampleCode: baseline.code || 'E_NO_PID',
+          hint: '拿不到内存基线：填 engine.pid，或显式 verifyRss:false 接受无内存证据',
+        };
+      }
       rss = await waitForRssDrop({
         pid,
         before: rssBefore,
@@ -176,16 +193,18 @@ export class OllamaAdapter extends CodexAdapter {
         minDropBytes: Number(rssMinDropBytes ?? this.config.cleanup?.rssMinDropBytes ?? 64 * 1024 * 1024),
         timeoutMs: waitMs,
         pollMs,
+        platform: this.config.platform,
       });
       if (!rss.ok) {
         return {
           ok: false,
-          code: 'RSS_NOT_DROPPED',
+          code: rss.reason === 'unverifiable' ? 'RSS_UNVERIFIABLE' : 'RSS_NOT_DROPPED',
           provider: 'ollama',
           waitedMs: Date.now() - t0,
           rssBefore,
           rssAfter: rss.after,
           dropped: rss.dropped,
+          sampleCode: rss.code,
         };
       }
     }

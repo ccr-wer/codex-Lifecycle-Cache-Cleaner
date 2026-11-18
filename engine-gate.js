@@ -15,6 +15,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 
 import { readJson, writeJsonAtomic } from './state.js';
+import { canonicalEndpoint } from './endpoint.js';
 
 export const ENGINE_STATE = Object.freeze({
   OWNED_IDLE: 'owned_idle',
@@ -61,14 +62,17 @@ export class EngineGate {
   async registerOwnership(probe, { source = 'config' } = {}) {
     const reg = await this.#registry();
     const entry = {
-      endpoint: probe.endpoint || this.config.engine?.endpoint || null,
+      endpoint: canonicalEndpoint(probe.endpoint || this.config.engine?.endpoint) || null,
       model: probe.model || this.config.engine?.model || null,
       pid: probe.pid ?? this.config.engine?.pid ?? null,
       source,
       registeredAt: new Date().toISOString(),
     };
     const same = (reg.entries || []).some(
-      (e) => e.endpoint === entry.endpoint && e.model === entry.model && e.pid === entry.pid,
+      (e) =>
+        canonicalEndpoint(e.endpoint) === canonicalEndpoint(entry.endpoint) &&
+        e.model === entry.model &&
+        e.pid === entry.pid,
     );
     if (!same) {
       reg.entries = [...(reg.entries || []), entry].slice(-20);
@@ -79,12 +83,12 @@ export class EngineGate {
 
   async #matchRegistry(probe) {
     const reg = await this.#registry();
-    const ep = probe.endpoint || this.config.engine?.endpoint || null;
+    const ep = canonicalEndpoint(probe.endpoint || this.config.engine?.endpoint);
     const model = probe.model || this.config.engine?.model || null;
     return (
       (reg.entries || []).find(
         (e) =>
-          e.endpoint === ep &&
+          canonicalEndpoint(e.endpoint) === ep &&
           (!e.model || !model || e.model === model) &&
           (!e.pid || !probe.pid || e.pid === probe.pid),
       ) || null

@@ -85,6 +85,24 @@ codex-memory-cleaner/
 - `negations` 只增不减；行数少于 `meta.negationCount` → `E_LOG_SHRINK`，整轮中止。
 - `原始轨迹` 按内容 hash 去重，重复读到同一段不会重复追加。
 
+## 跨平台
+
+| 能力 | Windows | Linux | macOS |
+|---|---|---|---|
+| 核心逻辑（状态机/校验/写入） | 真机 46/46 通过 | 单元测试可覆盖，**未真机跑** | 同左 |
+| 采样口径 | `win_rss`：`Get-Process WorkingSet64` | `proc_rss`：`smaps_rollup` 的 Pss，回退 `status` 的 VmRSS | `footprint`：`vmmap -summary`，回退 `footprint -p` |
+| 显存口径 | `nvidia`：`nvidia-smi --query-compute-apps`（三平台通用，需显式开启） | 同左 | 同左 |
+| 引擎控制 | HTTP，平台无关 | 同左 | 同左 |
+| 真机释放断言 | **已做**（293MB → 37MB） | **未做** | **未做** |
+| hook 触发链路 | **未验证** | **未验证** | **未验证** |
+
+边界说清楚：Linux / macOS 的采样器只有**注入式单元测试**（`test/cross-platform.test.js`），没有真机引擎实例的 delta 证据；本文不宣称「已验证跨平台释放」。已列入技术债，摘除条件见下。
+
+### 技术债：非 Windows 真机效果断言
+
+- 现状：`proc_rss` / `footprint` / `nvidia` 三条采样路径只被单测覆盖（解析 + 失败语义），未在真机跑过「卸载后内存真降」。
+- 摘除条件（三者缺一不可）：对应平台真机 + 真实引擎实例 + 留下 delta 证据（before/after 数值、采样口径、命令原始输出）。
+
 ## 注册（本机未验证）
 
 > ⚠️ 实测 `~/.codex/hooks.json` 与 `~/.codex/hooks/hooks.json` 都未触发全局 hook，`codex debug prompt-input` 疑似不跑 hook。
@@ -120,7 +138,7 @@ codex-memory-cleaner/
 }
 ```
 
-- `engine.pid` 填了才做 RSS 复核（否则只看 `/api/ps`）。
+- `engine.pid` 是内存验证的前提：填了才采样；`verifyRss: true` 但拿不到基线或采不到数时，清理返回 `RSS_UNVERIFIABLE` 并**判失败**（日志不提交）。确定不需要内存证据时显式写 `verifyRss: false`。
 - 环境变量：`CODEX_MEMORY_PROVIDER` / `CODEX_MEMORY_MODEL` / `CODEX_MEMORY_ENDPOINT` / `CODEX_MEMORY_ENGINE_PID`、`CODEX_MEMORY_DISABLE_CLEANUP=1`、`CODEX_MEMORY_DISABLE_SUMMARY=1`。
 - 查看状态：`node hooks/hook-runner.js status`。
 
@@ -139,7 +157,7 @@ node hooks/hook-runner.js confirm-memory --scope global  --file ./profile.md
 npm test        # 等价于 node --test test/*.test.js
 ```
 
-本机 Node v24.16.0 / Windows：`tests 37 / pass 37 / fail 0`，约 5s。
+本机 Node v24.16.0 / Windows：`tests 46 / pass 46 / fail 0`，约 4s。
 
 | 用例 | 断言 |
 |---|---|
@@ -152,6 +170,7 @@ npm test        # 等价于 node --test test/*.test.js
 | V6 | stage 后崩溃 → 续跑 `attempt=2`，条目只落一次 |
 | V7 | I1–I6：`absent`/`foreign`/`unknown` 引擎写 0，审计码可区分 |
 | V8 | SessionStart 只输出 `additionalContext`；原生记忆只读导入 |
+| C1–C9 | 跨平台：选型、Pss/VmRSS 与 Windows 千分位解析、平台不匹配抛错、endpoint 别名与大小写、rename 重试三态、采样失败→`unverifiable`、无 home 抛 `E_NO_HOME` |
 
 V2 用假引擎 + 假 Ollama，证伪的是**测量链路与卸载语义**；换真 Ollama 时把 `engine.endpoint` / `engine.pid` 指过去，同一套断言仍然有效。
 
@@ -170,6 +189,9 @@ V2 用假引擎 + 假 Ollama，证伪的是**测量链路与卸载语义**；换
 
 ## 设计取舍
 
+- **四种采样口径，未知平台归 unverifiable**：`footprint` / `proc_rss` / `win_rss` / `nvidia` 各自对应一个 OS 的真实口径；不在白名单的平台没有可信口径，宁可报「无法验证」也不拿 `null` 冒充成功。
+- **采样口径由平台纯函数选出、可注入**：`pickSamplerKind({platform, hasNvidia})` 不读全局状态，测试才能用参数验证 win32/darwin 分支。
+- **`localhost` 与 `127.0.0.1` 视为同一引擎**：归属登记按归一化 endpoint 匹配，否则同一引擎会因写法不同被判 `foreign`。
 - **接地按「最匹配的一轮」算 Jaccard**：整篇 trace 求值会把正常摘要判死（条目往往只对应一两轮），逐轮取最大值语义是「至少被某一轮支持」。
 - **摘要异常不清理**：宁可多占一轮内存，也不接受「日志不可信还把引擎清了」。
 
