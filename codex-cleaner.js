@@ -51,7 +51,7 @@ export const DEFAULT_CONFIG = Object.freeze({
     pollMs: 300,
   },
   spill: { thresholdBytes: 32768 },
-  inject: { maxChars: 4000, negations: 12, openItems: 25, doneItems: 5, sharedChars: 800 },
+  inject: { maxChars: 4000, negations: 12, openItems: 25, doneItems: 5, sharedChars: 800, memoryChars: 1200, memoryEntryChars: 300 },
   limits: {
     entityJaccardMin: 0.6,
     entryJaccardMin: 0.5,
@@ -59,7 +59,7 @@ export const DEFAULT_CONFIG = Object.freeze({
     droppedRatioLimit: 0.3,
     maxItems: 200,
   },
-  memory: { maxChars: 4000 },
+  memory: { maxChars: 20000 },
   worklog: { maxChars: 400000 },
   lock: { ttlMs: 120000 },
   faults: [],

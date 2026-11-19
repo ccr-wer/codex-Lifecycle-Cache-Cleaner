@@ -14,7 +14,18 @@ import {
   projectMemoryFile,
   readText,
   writeTextAtomic,
+  FileLock,
 } from '../state.js';
+import {
+  parseMemory,
+  renderMemory,
+  mergeMemory,
+  markSuperseded,
+  listPending,
+  proposePending,
+  findPending,
+  removePending,
+} from '../memory-store.js';
 import { readTrace } from '../raw-trace.js';
 import { readNativeMemory } from '../native-memory.js';
 
@@ -99,9 +110,34 @@ export class CodexAdapter {
     });
   }
 
+  /** 同一 scope 的记忆写入串行化；短时争抢重试，长时间占用才报忙。 */
+  async #memoryLock(scope) {
+    for (let i = 0; i < 6; i += 1) {
+      const lock = await FileLock.acquire(path.join(this.paths.stateDir, `memory-${scope}.lock`), {
+        ttlMs: 10000,
+      });
+      if (lock) return lock;
+      await new Promise((r) => setTimeout(r, 40));
+    }
+    throw new MemoryError('E_MEMORY_BUSY', '另一个记忆写入正在进行，请稍后重试');
+  }
+
+  async #backupMemory(file, raw) {
+    const dir = path.join(path.dirname(file), '.backup');
+    await fsp.mkdir(dir, { recursive: true });
+    const base = path.basename(file);
+    const name = `${base}.${Date.now()}.bak`;
+    await fsp.writeFile(path.join(dir, name), raw, 'utf8');
+    const names = (await fsp.readdir(dir)).filter((n) => n.startsWith(base)).sort();
+    for (const n of names.slice(0, Math.max(0, names.length - 3))) {
+      await fsp.unlink(path.join(dir, n)).catch(() => {});
+    }
+  }
+
   /**
-   * 确认机制：没有 confirmed:true 一律拒写。
-   * 共享日志是跨会话长期记忆，模型不能自己往里写。
+   * 写入 = 读取 → 解析 → 合并 → 重渲染 → 原子替换。
+   * 不再整文件覆盖：同哈希去重，同键不同值标 conflict。
+   * 结构损坏时拒写并隔离，不用坏文件冲掉旧记忆。
    */
   async writeSharedMemory(scope, content, { confirmed = false, confirmationId = null, cwd } = {}) {
     if (!confirmed) {
@@ -109,30 +145,116 @@ export class CodexAdapter {
     }
     const text = String(content ?? '').trim();
     if (!text) throw new MemoryError('E_EMPTY_MEMORY', '内容为空');
-    const max = this.config.memory?.maxChars ?? 4000;
-    if (text.length > max) throw new MemoryError('E_MEMORY_TOO_LONG', `长度 ${text.length} > ${max}`);
-
     const file = this.sharedFile(scope, cwd);
-    const header = `<!-- shared:${scope} updated=${new Date().toISOString()} confirm=${confirmationId || 'cli'} -->\n`;
-    const r = await writeTextAtomic(file, `${header}${text}\n`);
-    return { ...r, path: file, scope };
+
+    const lock = await this.#memoryLock(scope);
+    try {
+      await fsp.mkdir(path.dirname(file), { recursive: true });
+      const raw = await readText(file);
+      const doc = parseMemory(raw, { scope });
+      if (doc.parseErrors.length && !doc.legacy) {
+        const q = path.join(this.paths.stateDir, 'memory-quarantine', `${scope}-${Date.now()}.md`);
+        await fsp.mkdir(path.dirname(q), { recursive: true });
+        await fsp.writeFile(q, raw, 'utf8');
+        throw new MemoryError('E_MEMORY_PARSE', `共享记忆结构损坏，已备份到 ${q}`, { quarantine: q });
+      }
+
+      const merged = mergeMemory(doc.entries, text, { source: confirmationId ? 'cli' : 'accept' });
+      const revision = (doc.revision || 0) + 1;
+      const md = renderMemory(merged.entries, { scope, revision });
+      const max = this.config.memory?.maxChars ?? 20000;
+      if (md.length > max) {
+        throw new MemoryError('E_MEMORY_TOO_LONG', `长度 ${md.length} > ${max}`);
+      }
+      if (raw.trim()) await this.#backupMemory(file, raw);
+
+      const r = await writeTextAtomic(file, md);
+      return {
+        ...r,
+        path: file,
+        scope,
+        revision,
+        entries: merged.entries.length,
+        added: merged.added,
+        duplicated: merged.duplicated,
+        conflicts: merged.conflicts,
+      };
+    } finally {
+      await lock.release();
+    }
   }
 
-  /** 模型只能提议：落到 pending，等用户确认。 */
-  async proposeSharedMemory(scope, content, { cwd, reason = '' } = {}) {
-    const dir = path.join(this.paths.stateDir, 'pending');
-    await fsp.mkdir(dir, { recursive: true });
-    const file = path.join(dir, `${scope}-${Date.now()}.md`);
-    const body = [
-      `<!-- propose scope=${scope} at=${new Date().toISOString()} -->`,
-      reason ? `<!-- reason: ${reason} -->` : '',
-      String(content ?? '').trim(),
-      '',
-    ]
-      .filter(Boolean)
-      .join('\n');
-    await fsp.writeFile(file, body, 'utf8');
-    return { path: file, scope, needsConfirmation: true };
+  /** 模型/用户可以提议，但不会直接落盘；写入必须经 accept。 */
+  async proposeSharedMemory(scope, content, { reason = '' } = {}) {
+    if (scope !== 'global' && scope !== 'project') throw new MemoryError('E_BAD_SCOPE', `scope=${scope}`);
+    const r = await proposePending(this.paths, { scope, text: content, reason });
+    return { ...r, scope, needsConfirmation: !r.duplicated };
+  }
+
+  async listPendingMemory() {
+    return listPending(this.paths);
+  }
+
+  /** 消费队列：把提案合并进共享层，成功后从 pending 移除。 */
+  async acceptPendingMemory(id) {
+    const item = await findPending(this.paths, id);
+    if (!item) throw new MemoryError('E_PENDING_NOT_FOUND', `找不到提案 ${id}`);
+    const r = await this.writeSharedMemory(item.scope, item.text, {
+      confirmed: true,
+      confirmationId: `accept:${item.id}`,
+    });
+    await removePending(this.paths, item);
+    return { ...r, accepted: item.id };
+  }
+
+  async rejectPendingMemory(id, { reason = '' } = {}) {
+    const item = await findPending(this.paths, id);
+    if (!item) throw new MemoryError('E_PENDING_NOT_FOUND', `找不到提案 ${id}`);
+    await removePending(this.paths, item, { rejected: true, reason });
+    return { rejected: item.id, reason };
+  }
+
+  /** 裁决冲突：保留 keepId，另一条标 superseded（不删行）。 */
+  async resolveConflict(scope, keepId, dropId, { cwd } = {}) {
+    const file = this.sharedFile(scope, cwd);
+    const lock = await this.#memoryLock(scope);
+    try {
+      const raw = await readText(file);
+      const doc = parseMemory(raw, { scope });
+      if (!doc.entries.some((e) => e.id === keepId)) throw new MemoryError('E_MEMORY_ID', `不存在 ${keepId}`);
+      const entries = markSuperseded(doc.entries, dropId, keepId).map((e) =>
+        e.id === keepId && e.status.startsWith('conflict') ? { ...e, status: 'active' } : e,
+      );
+      const revision = (doc.revision || 0) + 1;
+      await this.#backupMemory(file, raw);
+      await writeTextAtomic(file, renderMemory(entries, { scope, revision }));
+      return { scope, kept: keepId, superseded: dropId, revision };
+    } finally {
+      await lock.release();
+    }
+  }
+
+  /** 显式升级：project 条目提到 global，原条目标 superseded。 */
+  async promoteMemory(id, { to = 'global', reason = '', cwd } = {}) {
+    if (to !== 'global') throw new MemoryError('E_BAD_SCOPE', `to=${to}`);
+    const srcFile = this.sharedFile('project', cwd);
+    const raw = await readText(srcFile);
+    const doc = parseMemory(raw, { scope: 'project' });
+    const entry = doc.entries.find((e) => e.id === id);
+    if (!entry) throw new MemoryError('E_MEMORY_ID', `不存在 ${id}`);
+    const written = await this.writeSharedMemory('global', entry.text, {
+      confirmed: true,
+      confirmationId: `promote:${id}`,
+    });
+    const lock = await this.#memoryLock('project');
+    try {
+      const entries = markSuperseded(doc.entries, id, 'global');
+      await this.#backupMemory(srcFile, raw);
+      await writeTextAtomic(srcFile, renderMemory(entries, { scope: 'project', revision: (doc.revision || 0) + 1 }));
+    } finally {
+      await lock.release();
+    }
+    return { promoted: id, to, reason, global: written };
   }
 
   /* ---------------------------------------------------------------- 元信息 */

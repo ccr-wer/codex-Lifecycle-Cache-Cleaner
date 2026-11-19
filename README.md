@@ -24,6 +24,7 @@ codex-memory-cleaner/
 ├── engine-gate.js     # 清理唯一出口：探测 → 归属 → 放行/拒绝 → 执行 → 验证 → 审计
 ├── state.js           # ID 分配 / 迁移·差分白名单 / 实体 Jaccard / 锁 / journal
 ├── worklog.js         # 日志解析·渲染·锚点注入、总结 prompt
+├── memory-store.js    # 共享记忆条目层：解析/消重/冲突/提案队列
 ├── raw-trace.js       # 廉价微固化：rollout JSONL 尾部解析（不调模型）
 ├── native-memory.js   # 只读导入 ~/.codex/memories
 ├── rss.js             # 真实内存测量（VmRSS / footprint / WorkingSet64）
@@ -89,7 +90,7 @@ codex-memory-cleaner/
 
 | 能力 | Windows | Linux | macOS |
 |---|---|---|---|
-| 核心逻辑（状态机/校验/写入） | 真机 46/46 通过 | 单元测试可覆盖，**未真机跑** | 同左 |
+| 核心逻辑（状态机/校验/写入） | 真机 56/56 通过 | 单元测试可覆盖，**未真机跑** | 同左 |
 | 采样口径 | `win_rss`：`Get-Process WorkingSet64` | `proc_rss`：`smaps_rollup` 的 Pss，回退 `status` 的 VmRSS | `footprint`：`vmmap -summary`，回退 `footprint -p` |
 | 显存口径 | `nvidia`：`nvidia-smi --query-compute-apps`（三平台通用，需显式开启） | 同左 | 同左 |
 | 引擎控制 | HTTP，平台无关 | 同左 | 同左 |
@@ -142,14 +143,32 @@ codex-memory-cleaner/
 - 环境变量：`CODEX_MEMORY_PROVIDER` / `CODEX_MEMORY_MODEL` / `CODEX_MEMORY_ENDPOINT` / `CODEX_MEMORY_ENGINE_PID`、`CODEX_MEMORY_DISABLE_CLEANUP=1`、`CODEX_MEMORY_DISABLE_SUMMARY=1`。
 - 查看状态：`node hooks/hook-runner.js status`。
 
-### 共享记忆（写入必须确认）
+### 共享记忆（条目化）
 
 ```bash
+# 提议 -> 查看 -> 接受（提案不落盘）
+node hooks/hook-runner.js memory-propose --scope project --text "包管理器用 pnpm"
+node hooks/hook-runner.js memory-pending
+node hooks/hook-runner.js memory-accept <id>
+node hooks/hook-runner.js memory-reject <id> --reason "不准确"
+
+# 直接确认写入（走同一套合并逻辑）
 node hooks/hook-runner.js confirm-memory --scope project --file ./draft.md
-node hooks/hook-runner.js confirm-memory --scope global  --file ./profile.md
+
+# 查看 / 冲突 / 裁决 / 升级
+node hooks/hook-runner.js memory-list --scope project
+node hooks/hook-runner.js memory-conflicts
+node hooks/hook-runner.js memory-resolve --keep M1 --drop M2
+node hooks/hook-runner.js memory-promote M1 --to global
 ```
 
-全局层 `~/.codex/memory/global.md`，工作区层 `<cwd>/.codex/memory/project.md`。`writeSharedMemory` 没有 `confirmed:true` 一律抛 `E_CONFIRM_REQUIRED`，不存在自动写入路径。宿主原生 `~/.codex/memories` 只读导入（scope=`native`），**永不写回**。
+- **格式**：`<!--memory {...} -->` 头 + 每行 `- [M1] [active] 文本`；旧纯文本自动迁移为单条 `M1`，不丢原文。
+- **消重**：规范化文本哈希相同 → 记 `duplicated`；`key=value` 同键不同值 → 两条并存、都标 `conflict`，**不自动覆盖**。
+- **只增不删**：替换只标 `superseded by Mx`；每次写入前备份到 `.backup/`（保留 3 份）。
+- **拒写保护**：结构损坏 → `E_MEMORY_PARSE`，坏文件隔离到 `state/memory-quarantine/`。
+- **提案队列**：`state/pending/*.json`，`memory-propose` 生产、`memory-accept/reject` 消费，`status` 显示 pending 数。
+- **注入**：只注入 `active`；记忆单独 1200 字符预算（`inject.memoryChars`），不再被长条目挤掉。
+- **确认门槛**：`writeSharedMemory` 仍要求 `confirmed:true`，无自动写入路径；原生 `~/.codex/memories` 只读导入，永不写回。
 
 ## 测试
 
@@ -157,7 +176,7 @@ node hooks/hook-runner.js confirm-memory --scope global  --file ./profile.md
 npm test        # 等价于 node --test test/*.test.js
 ```
 
-本机 Node v24.16.0 / Windows：`tests 46 / pass 46 / fail 0`，约 4s。
+本机 Node v24.16.0 / Windows：`tests 56 / pass 56 / fail 0`，约 4s。
 
 | 用例 | 断言 |
 |---|---|
@@ -171,6 +190,7 @@ npm test        # 等价于 node --test test/*.test.js
 | V7 | I1–I6：`absent`/`foreign`/`unknown` 引擎写 0，审计码可区分 |
 | V8 | SessionStart 只输出 `additionalContext`；原生记忆只读导入 |
 | C1–C9 | 跨平台：选型、Pss/VmRSS 与 Windows 千分位解析、平台不匹配抛错、endpoint 别名与大小写、rename 重试三态、采样失败→`unverifiable`、无 home 抛 `E_NO_HOME` |
+| M1–M10 | 记忆层：去重、同键冲突、损坏拒写、墓碑不注入、预算截断、提案闭环、并发锁、旧格式迁移、裁决 |
 
 V2 用假引擎 + 假 Ollama，证伪的是**测量链路与卸载语义**；换真 Ollama 时把 `engine.endpoint` / `engine.pid` 指过去，同一套断言仍然有效。
 

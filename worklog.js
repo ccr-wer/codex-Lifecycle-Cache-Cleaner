@@ -12,6 +12,7 @@
  * negationCount 是防截断水位：文件里否定行少于它 -> E_LOG_SHRINK。
  */
 import { STATUS_VALUES, negNumOf, assertIdSequence, MemoryError } from './state.js';
+import { parseMemory } from './memory-store.js';
 
 export const WORKLOG_SCHEMA = 1;
 
@@ -174,7 +175,16 @@ export function renderAnchors({
   worklogPath = '',
   limits = {},
 }) {
-  const L = { maxChars: 4000, negations: 12, openItems: 25, doneItems: 5, sharedChars: 800, ...limits };
+  const L = {
+    maxChars: 4000,
+    negations: 12,
+    openItems: 25,
+    doneItems: 5,
+    sharedChars: 800,
+    memoryChars: 1200,
+    memoryEntryChars: 300,
+    ...limits,
+  };
   const lines = [];
   lines.push(`[codex-memory] session=${sessionId} source=${source}${parentId ? ` parent=${parentId}` : ''}`);
   if (parentId) lines.push(`本会话由 fork/resume 派生，以下锚点包含父会话 ${parentId} 的未完成项。`);
@@ -205,21 +215,49 @@ export function renderAnchors({
     lines.push('', `## 压缩水位 W${doc.meta.precompact}${w?.at ? ` @ ${w.at}` : ''}（PreCompact 只留锚点，不阻止压缩）`);
   }
 
+  lines.push('', `日志：${worklogPath || '(未落盘)'}`);
+  lines.push('续做前先读该文件；negations 段只读。');
+
+  // 记忆单独一档预算：只注入 active 条目；conflict/superseded 不注入。
+  // 拼接顺序仍是 core 在前，但 core 先按 (maxChars - 记忆预算) 截断，
+  // 因此记忆不会再被尾部截断整段丢掉。
+  const memoryLines = [];
   for (const [scope, label] of [
     ['project', '项目习惯'],
     ['global', '用户偏好'],
     ['native', '宿主原生记忆（只读）'],
   ]) {
-    const text = (shared?.[scope] || '').trim();
-    if (!text) continue;
-    lines.push('', `## 共享记忆 · ${label}`);
-    lines.push(clip(text, L.sharedChars));
+    const raw = (shared?.[scope] || '').trim();
+    if (!raw) continue;
+    let entries = [];
+    let conflicts = 0;
+    if (scope === 'native') {
+      entries = [{ id: null, status: 'active', text: raw }];
+    } else {
+      const doc = parseMemory(raw, { scope });
+      entries = doc.entries.filter((e) => String(e.status).startsWith('active'));
+      conflicts = doc.entries.filter((e) => String(e.status).startsWith('conflict')).length;
+    }
+    if (!entries.length && !conflicts) continue;
+    memoryLines.push(`## 共享记忆 · ${label}`);
+    for (const e of entries) {
+      memoryLines.push(`- ${e.id ? `${e.id} ` : ''}${clip(e.text, L.memoryEntryChars)}`);
+    }
+    if (conflicts) memoryLines.push(`（冲突 ${conflicts} 条未注入，用 memory-conflicts 查看）`);
+    memoryLines.push('');
   }
 
-  lines.push('', `日志：${worklogPath || '(未落盘)'}`);
-  lines.push('续做前先读该文件；negations 段只读。');
+  const memoryReserve = memoryLines.length ? L.memoryChars : 0;
+  const coreBudget = Math.max(600, L.maxChars - memoryReserve);
+  let core = lines.join('\n');
+  if (core.length > coreBudget) core = `${core.slice(0, coreBudget - 24)}\n…[anchors truncated]`;
 
-  let out = lines.join('\n');
+  let memory = memoryLines.join('\n').trim();
+  if (memory.length > L.memoryChars) {
+    memory = `${memory.slice(0, L.memoryChars - 20)}\n…[memory truncated]`;
+  }
+
+  let out = memory ? `${core}\n\n${memory}` : core;
   if (out.length > L.maxChars) out = `${out.slice(0, L.maxChars - 32)}\n…[anchors truncated]`;
   return out;
 }

@@ -15,6 +15,7 @@ import { pathToFileURL } from 'node:url';
 
 import { CodexCleaner, mergeConfig } from '../codex-cleaner.js';
 import { defaultPaths, readJsonSync } from '../state.js';
+import { parseMemory } from '../memory-store.js';
 import { createAdapter } from '../adapters/index.js';
 
 export const EVENT_HANDLERS = Object.freeze({
@@ -174,6 +175,7 @@ async function cmdStatus(argv) {
       cleanup: config.cleanup,
       summarize: config.summarize,
     },
+    memory: await memorySummary(config, cwd),
     journals,
   };
   process.stdout.write(`${JSON.stringify(out, null, 2)}\n`);
@@ -198,14 +200,155 @@ async function cmdConfirmMemory(argv) {
   process.stdout.write(`${JSON.stringify(r, null, 2)}\n`);
 }
 
+/* ------------------------------------------------------------ 记忆子命令 */
+
+function memoryCtx(args) {
+  const cwd = args.cwd || process.cwd();
+  const config = loadConfig({ cwd });
+  const built = buildCleaner(config);
+  return { cwd, config, ...built };
+}
+
+async function memorySummary(config, cwd) {
+  const { adapter } = buildCleaner(config);
+  const out = { pending: 0, scopes: {} };
+  try {
+    out.pending = (await adapter.listPendingMemory()).length;
+  } catch {
+    /* 没队列就是 0 */
+  }
+  for (const scope of ['project', 'global']) {
+    const doc = parseMemory(await adapter.readSharedMemory(scope, { cwd }), { scope });
+    out.scopes[scope] = {
+      revision: doc.revision,
+      active: doc.entries.filter((e) => String(e.status).startsWith('active')).length,
+      conflict: doc.entries.filter((e) => String(e.status).startsWith('conflict')).length,
+      superseded: doc.entries.filter((e) => String(e.status).startsWith('superseded')).length,
+      parseErrors: doc.parseErrors.length,
+    };
+  }
+  return out;
+}
+
+async function cmdMemoryList(argv) {
+  const args = parseArgs(argv);
+  const { adapter, cwd } = memoryCtx(args);
+  const scopes = args.scope ? [args.scope] : ['project', 'global'];
+  const out = {};
+  for (const scope of scopes) {
+    const doc = parseMemory(await adapter.readSharedMemory(scope, { cwd }), { scope });
+    out[scope] = {
+      revision: doc.revision,
+      entries: doc.entries.map((e) => ({ id: e.id, status: e.status, key: e.key || null, text: e.text })),
+      parseErrors: doc.parseErrors,
+    };
+  }
+  process.stdout.write(`${JSON.stringify(out, null, 2)}\n`);
+}
+
+async function cmdMemoryPropose(argv) {
+  const args = parseArgs(argv);
+  const scope = args.scope === 'global' ? 'global' : 'project';
+  const text = args.file && args.file !== true ? fs.readFileSync(String(args.file), 'utf8') : args.text;
+  if (!text || text === true) {
+    process.stderr.write('usage: memory-propose --scope project|global (--text <s> | --file <path>) [--reason <s>]\n');
+    process.exit(2);
+  }
+  const { adapter } = memoryCtx(args);
+  const r = await adapter.proposeSharedMemory(scope, text, { reason: args.reason || '' });
+  process.stdout.write(`${JSON.stringify(r, null, 2)}\n`);
+}
+
+async function cmdMemoryPending(argv) {
+  const args = parseArgs(argv);
+  const { adapter } = memoryCtx(args);
+  const items = await adapter.listPendingMemory();
+  process.stdout.write(
+    `${JSON.stringify(items.map((i) => ({ id: i.id, scope: i.scope, hash: i.hash, reason: i.reason, text: i.text })), null, 2)}\n`,
+  );
+}
+
+async function cmdMemoryAccept(argv) {
+  const args = parseArgs(argv);
+  const id = args.id || args._[0];
+  if (!id) {
+    process.stderr.write('usage: memory-accept <id>\n');
+    process.exit(2);
+  }
+  const { adapter } = memoryCtx(args);
+  const r = await adapter.acceptPendingMemory(String(id));
+  process.stdout.write(`${JSON.stringify(r, null, 2)}\n`);
+}
+
+async function cmdMemoryReject(argv) {
+  const args = parseArgs(argv);
+  const id = args.id || args._[0];
+  if (!id) {
+    process.stderr.write('usage: memory-reject <id> [--reason <s>]\n');
+    process.exit(2);
+  }
+  const { adapter } = memoryCtx(args);
+  const r = await adapter.rejectPendingMemory(String(id), { reason: args.reason || '' });
+  process.stdout.write(`${JSON.stringify(r, null, 2)}\n`);
+}
+
+async function cmdMemoryConflicts(argv) {
+  const args = parseArgs(argv);
+  const { adapter, cwd } = memoryCtx(args);
+  const out = {};
+  for (const scope of ['project', 'global']) {
+    const doc = parseMemory(await adapter.readSharedMemory(scope, { cwd }), { scope });
+    out[scope] = doc.entries
+      .filter((e) => String(e.status).startsWith('conflict'))
+      .map((e) => ({ id: e.id, status: e.status, key: e.key, text: e.text }));
+  }
+  process.stdout.write(`${JSON.stringify(out, null, 2)}\n`);
+}
+
+async function cmdMemoryResolve(argv) {
+  const args = parseArgs(argv);
+  const scope = args.scope === 'global' ? 'global' : 'project';
+  const keep = args.keep;
+  const drop = args.drop || args._[0];
+  if (!keep || !drop) {
+    process.stderr.write('usage: memory-resolve --keep <id> --drop <id> [--scope project|global]\n');
+    process.exit(2);
+  }
+  const { adapter, cwd } = memoryCtx(args);
+  const r = await adapter.resolveConflict(scope, String(keep), String(drop), { cwd });
+  process.stdout.write(`${JSON.stringify(r, null, 2)}\n`);
+}
+
+async function cmdMemoryPromote(argv) {
+  const args = parseArgs(argv);
+  const id = args.id || args._[0];
+  if (!id) {
+    process.stderr.write('usage: memory-promote <id> --to global [--reason <s>]\n');
+    process.exit(2);
+  }
+  const { adapter, cwd } = memoryCtx(args);
+  const r = await adapter.promoteMemory(String(id), { to: 'global', reason: args.reason || '', cwd });
+  process.stdout.write(`${JSON.stringify(r, null, 2)}\n`);
+}
+
 async function main(argv) {
   const [event, ...rest] = argv;
   if (event === 'status') return cmdStatus(rest);
   if (event === 'confirm-memory') return cmdConfirmMemory(rest);
+  if (event === 'memory-list') return cmdMemoryList(rest);
+  if (event === 'memory-pending') return cmdMemoryPending(rest);
+  if (event === 'memory-propose') return cmdMemoryPropose(rest);
+  if (event === 'memory-accept') return cmdMemoryAccept(rest);
+  if (event === 'memory-reject') return cmdMemoryReject(rest);
+  if (event === 'memory-conflicts') return cmdMemoryConflicts(rest);
+  if (event === 'memory-resolve') return cmdMemoryResolve(rest);
+  if (event === 'memory-promote') return cmdMemoryPromote(rest);
   if (EVENT_HANDLERS[event]) return runHook(event, { argv: rest });
 
   process.stderr.write(
-    `usage: hook-runner <session-start|session-end|pre-compact|post-tool-use|status|confirm-memory>\n`,
+    'usage: hook-runner <session-start|session-end|pre-compact|post-tool-use|status|confirm-memory|' +
+      'memory-list|memory-pending|memory-propose|memory-accept|memory-reject|memory-conflicts|' +
+      'memory-resolve|memory-promote>\n',
   );
   process.exit(2);
 }
